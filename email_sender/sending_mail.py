@@ -2,6 +2,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
+import socket
 from dotenv import load_dotenv
 from email_sender.templates import render_template
 from email.utils import formataddr, make_msgid, formatdate
@@ -10,17 +11,33 @@ import csv
 
 load_dotenv()
 
+
+def _as_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _normalized_host(value: str | None) -> str:
+    host = (value or "").strip()
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    return host.strip("/")
+
 email_user = os.getenv("SMTP_USER")
 email_password = os.getenv("SMTP_PASS")
-email_host = os.getenv("SMTP_HOST")
+email_host = _normalized_host(os.getenv("SMTP_HOST"))
 email_port = int(os.getenv("SMTP_PORT", "587"))
-# prefer implicit SSL if explicitly set or commonly-used SSL port
-use_ssl = (
-    os.getenv("SMTP_SSL", "false").lower() in ("1", "true", "yes") or email_port == 465
-)
-use_starttls = (
-    os.getenv("SMTP_STARTTLS", "true").lower() in ("1", "true", "yes") and not use_ssl
-)
+use_ssl = _as_bool(os.getenv("SMTP_SSL"), default=(email_port == 465))
+use_starttls = _as_bool(os.getenv("SMTP_STARTTLS"), default=(email_port == 587)) and not use_ssl
+email_subject = os.getenv("EMAIL_SUBJECT")
+
+if not email_host:
+    raise RuntimeError("SMTP_HOST is missing or empty.")
+if not email_user or not email_password:
+    raise RuntimeError("SMTP_USER and SMTP_PASS must be set.")
+if not email_subject:
+    raise RuntimeError("EMAIL_SUBJECT must be set.")
 
 # CSV recipients settings
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -60,25 +77,54 @@ for e in recipients:
 if not emails:
     raise RuntimeError(f"No recipient addresses found in column '{recipients_column}' of {recipients_file}.")
 
+
+def connect_smtp(host: str, port: int, prefer_ssl: bool, prefer_starttls: bool):
+    attempts = []
+
+    if prefer_ssl:
+        attempts.append(("ssl", port))
+    elif prefer_starttls:
+        attempts.append(("starttls", port))
+    else:
+        attempts.append(("plain", port))
+
+    for candidate in (("starttls", 587), ("ssl", 465), ("plain", 25)):
+        if candidate not in attempts:
+            attempts.append(candidate)
+
+    last_err = None
+    for mode, candidate_port in attempts:
+        try:
+            socket.create_connection((host, candidate_port), timeout=8).close()
+            print(f"[SMTP] TCP reachable: {host}:{candidate_port} ({mode})")
+
+            if mode == "ssl":
+                server = smtplib.SMTP_SSL(host, candidate_port, timeout=30)
+            else:
+                server = smtplib.SMTP(host, candidate_port, timeout=30)
+                server.ehlo()
+                if mode == "starttls":
+                    server.starttls()
+                    server.ehlo()
+
+            server.login(email_user, email_password)
+            print(f"[SMTP] Connected/login successful via {mode} on port {candidate_port}")
+            return server
+        except Exception as err:
+            last_err = err
+            print(f"[SMTP] Failed via {mode} on {host}:{candidate_port} -> {type(err).__name__}: {err}")
+
+    raise RuntimeError(f"Could not connect/login to SMTP server {host}.") from last_err
+
 server = None
 try:
-    # choose correct connection method
-    if use_ssl:
-        server = smtplib.SMTP_SSL(email_host, email_port, timeout=10)
-    else:
-        server = smtplib.SMTP(email_host, email_port, timeout=10)
-        if use_starttls:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-
-    server.login(email_user, email_password)
+    server = connect_smtp(email_host, email_port, use_ssl, use_starttls)
 
     for to_addr in emails:
         msg = MIMEMultipart()
         msg["From"] = formataddr((os.getenv("FROM_NAME", ""), email_user))
         msg["To"] = to_addr
-        msg["Subject"] = Header("Test subject", "utf-8")
+        msg["Subject"] = Header(email_subject, "utf-8")
         msg["Date"] = formatdate(localtime=True)
         msg["Message-ID"] = make_msgid()
         msg["List-Unsubscribe"] = f"<mailto:unsubscribe@{os.getenv('FROM_DOMAIN')}>"

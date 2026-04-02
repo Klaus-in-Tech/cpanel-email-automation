@@ -1,0 +1,16 @@
+.env
+__pycache__/
+.venv/
+env/
+*.pyc
+dist/
+build/
+/.mypy_cache
+/.pytest_cache
+logs/
+.ruff_cache/
+recipients.csv
+sent-to-recipients.csv
+email.txt
+autoemails.csv
+templates/autoemails.csv
