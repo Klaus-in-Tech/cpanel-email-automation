@@ -7,6 +7,11 @@ from dotenv import load_dotenv
 from email_sender.templates import render_template
 from email.utils import formataddr, make_msgid, formatdate
 from email.header import Header
+from email.mime.base import MIMEBase
+from email import encoders
+import mimetypes
+
+
 import csv
 
 load_dotenv()
@@ -31,6 +36,15 @@ email_port = int(os.getenv("SMTP_PORT", "587"))
 use_ssl = _as_bool(os.getenv("SMTP_SSL"), default=(email_port == 465))
 use_starttls = _as_bool(os.getenv("SMTP_STARTTLS"), default=(email_port == 587)) and not use_ssl
 email_subject = os.getenv("EMAIL_SUBJECT")
+
+# Single attachment setting (optional)
+attachment_path = os.getenv("ATTACHMENT_PATH", "").strip()
+if attachment_path:
+    if not os.path.exists(attachment_path):
+        raise RuntimeError(f"Attachment file not found: {attachment_path}")
+    if not os.path.isfile(attachment_path):
+        raise RuntimeError(f"Attachment path is not a file: {attachment_path}")
+
 
 if not email_host:
     raise RuntimeError("SMTP_HOST is missing or empty.")
@@ -116,6 +130,23 @@ def connect_smtp(host: str, port: int, prefer_ssl: bool, prefer_starttls: bool):
 
     raise RuntimeError(f"Could not connect/login to SMTP server {host}.") from last_err
 
+def _attach_file(msg: MIMEMultipart, path: str) -> None:
+    ctype, encoding = mimetypes.guess_type(path)
+    if ctype is None or encoding is not None:
+        ctype = "application/octet-stream"
+    maintype, subtype = ctype.split("/", 1)
+
+    with open(path, "rb") as f:
+        part = MIMEBase(maintype, subtype)
+        part.set_payload(f.read())
+
+    encoders.encode_base64(part)
+    part.add_header(
+        "Content-Disposition",
+        f'attachment; filename="{os.path.basename(path)}"'
+    )
+    msg.attach(part)
+
 server = None
 try:
     server = connect_smtp(email_host, email_port, use_ssl, use_starttls)
@@ -131,6 +162,10 @@ try:
 
         body = render_template("email.txt")
         msg.attach(MIMEText(body, "plain"))
+
+        # Attach single file to every outgoing email (if configured)
+        if attachment_path:
+            _attach_file(msg, attachment_path)
 
         try:
             server.sendmail(email_user, to_addr, msg.as_string())
